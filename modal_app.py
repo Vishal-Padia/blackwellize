@@ -1,4 +1,3 @@
-# modal_app.py
 import modal
 
 cutedsl_cache = modal.Volume.from_name("cutedsl-cache", create_if_missing=True)
@@ -15,26 +14,24 @@ image = (
 
 app = modal.App("cutedsl-b200", image=image)
 
+GPU = "B200"
+VOLUMES = {"/root/.cache/cutedsl": cutedsl_cache}
 
-@app.function(
-    gpu="B200",
-    # env={"CUTE_DSL_LOG_TO_CONSOLE": "1"},
-    volumes={"/root/.cache/cutedsl": cutedsl_cache},
-    timeout=900,
-)
-def run():
+
+@app.function(gpu=GPU, volumes=VOLUMES, timeout=900)
+def smoke():
+    """Sanity check that the DSL compiles and runs on this GPU."""
     import cutlass
-    import torch, cutlass.cute as cute
+    import cutlass.cute as cute
+    import torch
     from cutlass.cute.runtime import from_dlpack
     from kernels.test import elem_add
 
     cutlass.cuda.initialize_cuda_context()
 
     props = torch.cuda.get_device_properties(0)
-    print(props.name, f"sm_{props.major}{props.minor}")   # expect sm_100
+    print(props.name, f"sm_{props.major}{props.minor}")  # expect sm_100
 
-    
-    # host side
     n = 1 << 20
     a = torch.randn(n, device="cuda", dtype=torch.float32)
     b = torch.randn(n, device="cuda", dtype=torch.float32)
@@ -50,6 +47,30 @@ def run():
     cutedsl_cache.commit()
 
 
+@app.function(gpu=GPU, volumes=VOLUMES, timeout=1800)
+def fp16_gemm(m: int = 8192, n: int = 8192, k: int = 8192, iters: int = 20):
+    """Correctness-check + benchmark the hand-rolled Blackwell fp16 GEMM."""
+    import cutlass
+    import torch
+    from kernels.fp16_gemm_manual import run
+
+    cutlass.cuda.initialize_cuda_context()
+    props = torch.cuda.get_device_properties(0)
+    print(f"{props.name}  sm_{props.major}{props.minor}")
+
+    res = run(m=m, n=n, k=k, iters=iters)
+    print(f"mnk               : {res['mnk']}")
+    print(f"cute (manual)     : {res['ours_ms']:8.3f} ms   {res['ours_tflops']:8.1f} TFLOP/s")
+    print(f"torch.matmul      : {res['torch_ms']:8.3f} ms   {res['torch_tflops']:8.1f} TFLOP/s")
+    print(f"ratio             : {res['ours_tflops'] / res['torch_tflops']:.2f}x of torch")
+
+    cutedsl_cache.commit()
+    return res
+
+
 @app.local_entrypoint()
-def main():
-    run.remote()
+def main(m: int = 8192, n: int = 8192, k: int = 8192, iters: int = 20, smoke_test: bool = False):
+    if smoke_test:
+        smoke.remote()
+    else:
+        fp16_gemm.remote(m=m, n=n, k=k, iters=iters)

@@ -9,15 +9,14 @@ acc_dtype = cutlass.Float32
 mma_inst_shape_mnk = (128, 256, 16)
 mma_tiler_mnk = (128, 256, 64)
 threads_per_cta = 128
-ab_stages = 4
+ab_stages = 1  # single buffer: the loader and the MMA take turns
 tmem_cols = 512
 
 
-def k_sw128_atom():
-    """128B swizzle atom: 8 rows x 64 fp16 (=128B, the widest pattern)."""
-    return cute.make_composed_layout(
-        cute.make_swizzle(3, 4, 3), 0, cute.make_layout((8, 64), stride=(64, 1))
-    )
+# Plain K-major SMEM tiling unit: 8 rows x 8 fp16 = 16B, the minimum contiguity
+# UMMA accepts. No swizzle at all, so MMA reads and TMA writes keep hitting the
+# same SMEM banks.
+SMEM_ATOM = (8, 8)
 
 
 @cute.kernel
@@ -28,40 +27,29 @@ def gemm_kernel(
     tma_atom_b: cute.CopyAtom,
     mB_nk: cute.Tensor,
     mC_mn: cute.Tensor,
-    a_smem_layout: cute.ComposedLayout,
-    b_smem_layout: cute.ComposedLayout,
+    a_smem_layout: cute.Layout,
+    b_smem_layout: cute.Layout,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     bidx, bidy, _ = cute.arch.block_idx()
     mma_coord_mnk = (bidx, bidy, None)
 
-    # SMEM
-    a_smem_ptr = cute.arch.alloc_smem(
-        io_dtype, mma_tiler_mnk[0] * mma_tiler_mnk[2] * ab_stages, 1024
-    )
-    b_smem_ptr = cute.arch.alloc_smem(
-        io_dtype, mma_tiler_mnk[1] * mma_tiler_mnk[2] * ab_stages, 1024
-    )
-    ab_full_mbar = cute.arch.alloc_smem(cutlass.Int64, ab_stages, 8)
-    ab_empty_mbar = cute.arch.alloc_smem(cutlass.Int64, ab_stages, 8)
-    acc_full_mbar = cute.arch.alloc_smem(cutlass.Int64, 1, 8)
+    # SMEM: one A tile + one B tile = 16 + 32 = 48 KiB
+    a_smem_ptr = cute.arch.alloc_smem(io_dtype, mma_tiler_mnk[0] * mma_tiler_mnk[2], 1024)
+    b_smem_ptr = cute.arch.alloc_smem(io_dtype, mma_tiler_mnk[1] * mma_tiler_mnk[2], 1024)
+    # Two barriers, one stage each: data-arrived, and MMA-finished-reading.
+    ab_full_mbar = cute.arch.alloc_smem(cutlass.Int64, 1, 8)
+    mma_done_mbar = cute.arch.alloc_smem(cutlass.Int64, 1, 8)
     tmem_addr_slot = cute.arch.alloc_smem(cutlass.Int32, 1, 16)
 
-    # swizzle rides on the pointer, shape/stride on the layout
-    sA = cute.make_tensor(
-        cute.recast_ptr(a_smem_ptr, a_smem_layout.inner, dtype=io_dtype), a_smem_layout.outer
-    )
-    sB = cute.make_tensor(
-        cute.recast_ptr(b_smem_ptr, b_smem_layout.inner, dtype=io_dtype), b_smem_layout.outer
-    )
+    sA = cute.make_tensor(a_smem_ptr, a_smem_layout)
+    sB = cute.make_tensor(b_smem_ptr, b_smem_layout)
 
     if warp_idx == 0:
         with cute.arch.elect_one():
-            for i in cutlass.range_constexpr(ab_stages):
-                cute.arch.mbarrier_init(ab_full_mbar + i, 1)  # TMA transaction
-                cute.arch.mbarrier_init(ab_empty_mbar + i, 1)  # one tcgen05.commit
-            cute.arch.mbarrier_init(acc_full_mbar, 1)
+            cute.arch.mbarrier_init(ab_full_mbar, 1)  # TMA transaction
+            cute.arch.mbarrier_init(mma_done_mbar, 1)  # one tcgen05.commit
         cpasync.prefetch_descriptor(tma_atom_a)
         cpasync.prefetch_descriptor(tma_atom_b)
         cute.arch.alloc_tmem(tmem_cols, tmem_addr_slot)  # warp-wide, not elected
@@ -95,67 +83,55 @@ def gemm_kernel(
         cute.group_modes(sB, 0, 3), cute.group_modes(tCgB, 0, 3),
     )
 
-    # ab_full is a transaction barrier, so A and B can share one barrier per stage
+    # ab_full is a transaction barrier, so A and B can share it
     bytes_per_stage = cute.size_in_bytes(
         io_dtype, cute.select(a_smem_layout, mode=[0, 1, 2])
     ) + cute.size_in_bytes(io_dtype, cute.select(b_smem_layout, mode=[0, 1, 2]))
 
     num_k_tiles = cute.size(gA, mode=[2])
     num_k_blocks = cute.size(tCrA, mode=[2])
-    lookahead = min(ab_stages - 1, num_k_tiles)
 
     if warp_idx == 0:
-        load_stage = cutlass.Int32(0)
-        load_phase = cutlass.Int32(1)  # nothing arrived yet => wait falls through
-        mma_stage = cutlass.Int32(0)
-        mma_phase = cutlass.Int32(0)
-
-        for k_tile in cutlass.range_constexpr(lookahead):  # buffers start empty
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(ab_full_mbar + k_tile, bytes_per_stage)
-            cute.copy(tma_atom_a, tAgA[(None, k_tile)], tAsA[(None, k_tile)],
-                      tma_bar_ptr=ab_full_mbar + k_tile)
-            cute.copy(tma_atom_b, tBgB[(None, k_tile)], tBsB[(None, k_tile)],
-                      tma_bar_ptr=ab_full_mbar + k_tile)
-            load_stage += 1
+        # One buffer reused every iteration, so each barrier completes exactly
+        # once per K-tile and its phase just alternates.
+        full_phase = cutlass.Int32(0)
+        done_phase = cutlass.Int32(0)
 
         for k_tile in cutlass.range(num_k_tiles, unroll=1):
-            k_tile_to_load = k_tile + lookahead
-            if k_tile_to_load < num_k_tiles:
-                cute.arch.mbarrier_wait(ab_empty_mbar + load_stage, load_phase)
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(ab_full_mbar + load_stage, bytes_per_stage)
-                cute.copy(tma_atom_a, tAgA[(None, k_tile_to_load)], tAsA[(None, load_stage)],
-                          tma_bar_ptr=ab_full_mbar + load_stage)
-                cute.copy(tma_atom_b, tBgB[(None, k_tile_to_load)], tBsB[(None, load_stage)],
-                          tma_bar_ptr=ab_full_mbar + load_stage)
-                load_stage += 1
-                if load_stage == ab_stages:
-                    load_stage = cutlass.Int32(0)
-                    load_phase ^= 1
+            # load
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(ab_full_mbar, bytes_per_stage)
+            cute.copy(tma_atom_a, tAgA[(None, k_tile)], tAsA[(None, 0)], tma_bar_ptr=ab_full_mbar)
+            cute.copy(tma_atom_b, tBgB[(None, k_tile)], tBsB[(None, 0)], tma_bar_ptr=ab_full_mbar)
 
-            cute.arch.mbarrier_wait(ab_full_mbar + mma_stage, mma_phase)
+            # wait for it -- nothing else to do meanwhile, there is no other buffer
+            cute.arch.mbarrier_wait(ab_full_mbar, full_phase)
+            full_phase ^= 1
+
             for k_block in cutlass.range_constexpr(num_k_blocks):
                 cute.gemm(
                     tiled_mma, tCtAcc,
-                    tCrA[(None, None, k_block, mma_stage)],
-                    tCrB[(None, None, k_block, mma_stage)],
+                    tCrA[(None, None, k_block, 0)],
+                    tCrB[(None, None, k_block, 0)],
                     tCtAcc,
                 )
                 tiled_mma.set(tcgen05.Field.ACCUMULATE, True)  # first MMA overwrites
 
-            with cute.arch.elect_one():  # arrives once the MMA has read SMEM
-                tcgen05.commit(ab_empty_mbar + mma_stage)
-            mma_stage += 1
-            if mma_stage == ab_stages:
-                mma_stage = cutlass.Int32(0)
-                mma_phase ^= 1
+            # the next iteration overwrites sA/sB, so the MMA must be done reading
+            with cute.arch.elect_one():
+                tcgen05.commit(mma_done_mbar)
+            cute.arch.mbarrier_wait(mma_done_mbar, done_phase)
+            done_phase ^= 1
 
-        with cute.arch.elect_one():
-            tcgen05.commit(acc_full_mbar)
         cute.arch.relinquish_tmem_alloc_permit()
 
-    # Epilogue, all 128 threads: TMEM -> RMEM -> GMEM, in 4 chunks for overlap
+    # Epilogue, all 128 threads: TMEM -> RMEM -> GMEM. The last mma_done wait
+    # above already guarantees the accumulator is complete; this just publishes
+    # it to the other three warps.
+    cute.arch.sync_threads()
+
+    # 4 chunks because the tcgen05.ld atom below moves 64 fp32 per thread and the
+    # accumulator is 128x256.
     epi_tiler = ((cute.size(tCtAcc, mode=[0, 0]), cute.size(tCtAcc, mode=[0, 1]) // 4),)
     tCtAcc_epi = cute.zipped_divide(tCtAcc, epi_tiler)
     gC_epi = cute.zipped_divide(tCgC, epi_tiler)
@@ -169,7 +145,6 @@ def gemm_kernel(
     acc_frag = cute.make_rmem_tensor(gmem_dst[None, None, 0].shape, acc_dtype)
     out_frag = cute.make_rmem_tensor(gmem_dst[None, None, 0].shape, io_dtype)
 
-    cute.arch.mbarrier_wait(acc_full_mbar, cutlass.Int32(0))
     for i in cutlass.range_constexpr(cute.size(tmem_src, mode=[2])):
         cute.copy(tmem_tiled_copy, tmem_src[None, None, i], acc_frag)
         out_frag.store(acc_frag.load().to(io_dtype))
@@ -200,8 +175,9 @@ def gemm_host(a: cute.Tensor, b: cute.Tensor, c: cute.Tensor):
         tiled_mma.partition_shape_B(cute.dice(mma_tiler_mnk, (None, 1, 1))), ab_stages
     )
     # order=(1,2,3): K first, then MN, then stages -> one stage is contiguous K-major
-    a_smem_layout = tcgen05.tile_to_mma_shape(k_sw128_atom(), a_smem_shape, order=(1, 2, 3))
-    b_smem_layout = tcgen05.tile_to_mma_shape(k_sw128_atom(), b_smem_shape, order=(1, 2, 3))
+    smem_atom = cute.make_layout(SMEM_ATOM, stride=(SMEM_ATOM[1], 1))
+    a_smem_layout = tcgen05.tile_to_mma_shape(smem_atom, a_smem_shape, order=(1, 2, 3))
+    b_smem_layout = tcgen05.tile_to_mma_shape(smem_atom, b_smem_shape, order=(1, 2, 3))
 
     tma_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
     tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(

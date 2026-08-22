@@ -36,6 +36,9 @@ def gemm_one_cta(
             cute.arch.mbarrier_init(ab_full_mbar, 1)
             cute.arch.mbarrier_init(mma_done_mbar, 1)
         cute.arch.alloc_tmem(tmem_cols, tmem_addr_slot)
+        # nothing more to allocate: release the permit now so other CTAs can
+        # allocate. This does not release our columns -- dealloc_tmem does.
+        cute.arch.relinquish_tmem_alloc_permit()
 
     cute.arch.mbarrier_init_fence()
     cute.arch.sync_threads()
@@ -68,7 +71,9 @@ def gemm_one_cta(
         # one lane announces the byte count for both copies
         with cute.arch.elect_one():
             cute.arch.mbarrier_arrive_and_expect_tx(ab_full_mbar, nbytes)
-        # ...but the whole warp issues the copies, never inside elect_one
+        # ...but the copies go out from the whole warp. cute.copy emits its own
+        # full-warp elect.sync, so an outer elect_one would leave one lane at a
+        # vote that needs all 32 -> deadlock
         cute.copy(bulk, gA, sA, mbar_ptr=ab_full_mbar)
         cute.copy(bulk, gB, sB, mbar_ptr=ab_full_mbar)
 
@@ -82,7 +87,6 @@ def gemm_one_cta(
         with cute.arch.elect_one():
             tcgen05.commit(mma_done_mbar)
         cute.arch.mbarrier_wait(mma_done_mbar, 0)
-        cute.arch.relinquish_tmem_alloc_permit()
 
     cute.arch.sync_threads()
 

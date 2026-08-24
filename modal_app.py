@@ -16,9 +16,10 @@ app = modal.App("cutedsl-b200", image=image)
 
 GPU = "B200"
 VOLUMES = {"/root/.cache/cutedsl": cutedsl_cache}
+ENV = {"CUTE_DSL_CACHE_DIR": "/root/.cache/cutedsl"}
 
 
-@app.function(gpu=GPU, volumes=VOLUMES, timeout=900)
+@app.function(gpu=GPU, volumes=VOLUMES, env=ENV, timeout=900)
 def smoke():
     """Sanity check that the DSL compiles and runs on this GPU."""
     import cutlass
@@ -47,7 +48,7 @@ def smoke():
     cutedsl_cache.commit()
 
 
-@app.function(gpu=GPU, volumes=VOLUMES, timeout=1800)
+@app.function(gpu=GPU, volumes=VOLUMES, env=ENV, timeout=1800)
 def fp16_gemm(m: int = 8192, n: int = 8192, k: int = 8192, iters: int = 20):
     """Correctness-check + benchmark the hand-rolled Blackwell fp16 GEMM."""
     import cutlass
@@ -68,9 +69,26 @@ def fp16_gemm(m: int = 8192, n: int = 8192, k: int = 8192, iters: int = 20):
     return res
 
 
+@app.function(gpu=GPU, volumes=VOLUMES, env=ENV, timeout=900)
+def gemm_01_one_cta(m: int = 128, n: int = 256, k: int = 64):
+    """Run the one-CTA CPAsync load kernel (smoke test)."""
+    import cutlass
+    import torch
+    from kernels.gemm_01_one_cta import run
+
+    cutlass.cuda.initialize_cuda_context()
+    props = torch.cuda.get_device_properties(0)
+    print(f"{props.name}  sm_{props.major}{props.minor}")
+
+    run(m=m, n=n, k=k)
+    cutedsl_cache.commit()
+
+
 @app.local_entrypoint()
-def main(m: int = 8192, n: int = 8192, k: int = 8192, iters: int = 20, smoke_test: bool = False):
+def main(m: int = 8192, n: int = 8192, k: int = 8192, iters: int = 20, smoke_test: bool = False, gemm_01: bool = False):
     if smoke_test:
         smoke.remote()
+    elif gemm_01:
+        gemm_01_one_cta.remote(m=m, n=n, k=k)
     else:
         fp16_gemm.remote(m=m, n=n, k=k, iters=iters)

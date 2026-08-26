@@ -206,7 +206,7 @@ def gemm_k_loop_host(a: cute.Tensor, b: cute.Tensor, c: cute.Tensor):
     )
 
 
-def run(m: int = 256, n: int = 512, k: int = 4096):
+def run(m: int = 256, n: int = 512, k: int = 4096, iters: int = 50):
     """One UMMA per CTA over an m x n grid of tiles, checked against torch."""
     import torch
     from cutlass.cute.runtime import from_dlpack
@@ -240,3 +240,24 @@ def run(m: int = 256, n: int = 512, k: int = 4096):
     torch.testing.assert_close(c, ref, atol=3e-1, rtol=1e-3)
 
     print("gemm_03_k_loop: ok")
+
+    def bench(fn):
+        for _ in range(5):
+            fn()
+        torch.cuda.synchronize()
+        start, stop = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+        start.record()
+        for _ in range(iters):
+            fn()
+        stop.record()
+        torch.cuda.synchronize()
+        return start.elapsed_time(stop) / iters * 1e-3
+
+    flops = 2 * m * n * k
+    ours = bench(lambda: compiled(a_t, b_t, c_t))
+    theirs = bench(lambda: torch.matmul(a, b.t()))
+
+    print(f"\n{m}x{n}x{k}, {iters} iters")
+    for name, secs in (("gemm_03", ours), ("torch", theirs)):
+        print(f"  {name:8s} {secs * 1e6:9.1f} us  {flops / secs / 1e12:8.1f} TFLOP/s")
+    print(f"  ratio    {theirs / ours:9.2f}x")

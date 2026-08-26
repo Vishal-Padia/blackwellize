@@ -100,7 +100,7 @@ def gemm_02_multi_cta(m: int = 256, n: int = 512, k: int = 16):
 
 
 @app.function(gpu=GPU, volumes=VOLUMES, env=ENV, timeout=900)
-def gemm_03_k_loop(m: int = 256, n: int = 512, k: int = 4096):
+def gemm_03_k_loop(m: int = 256, n: int = 512, k: int = 4096, iters: int = 50):
     """A K-loop of UMMAs per CTA, accumulating in TMEM."""
     import cutlass
     import torch
@@ -110,7 +110,7 @@ def gemm_03_k_loop(m: int = 256, n: int = 512, k: int = 4096):
     props = torch.cuda.get_device_properties(0)
     print(f"{props.name}  sm_{props.major}{props.minor}")
 
-    run(m=m, n=n, k=k)
+    run(m=m, n=n, k=k, iters=iters)
     cutedsl_cache.commit()
 
 
@@ -132,6 +132,6 @@ def main(
     elif gemm_02:
         gemm_02_multi_cta.remote(m=m, n=n, k=k)
     elif gemm_03:
-        gemm_03_k_loop.remote(m=m, n=n, k=k)
+        gemm_03_k_loop.remote(m=m, n=n, k=k, iters=iters)
     else:
         fp16_gemm.remote(m=m, n=n, k=k, iters=iters)

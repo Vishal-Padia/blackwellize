@@ -129,6 +129,21 @@ def gemm_04_pipelined(m: int = 256, n: int = 512, k: int = 4096, iters: int = 50
     cutedsl_cache.commit()
 
 
+@app.function(gpu=GPU, volumes=VOLUMES, env=ENV, timeout=900)
+def gemm_05_warp_specialized(m: int = 256, n: int = 512, k: int = 4096, iters: int = 50):
+    """A warp-specialized GEMM implementation."""
+    import cutlass
+    import torch
+    from kernels.gemm_05_warp_specialized import run
+
+    cutlass.cuda.initialize_cuda_context()
+    props = torch.cuda.get_device_properties(0)
+    print(f"{props.name}  sm_{props.major}{props.minor}")
+
+    run(m=m, n=n, k=k, iters=iters)
+    cutedsl_cache.commit()
+
+
 @app.local_entrypoint()
 def main(
     m: int = 8192,
@@ -140,6 +155,7 @@ def main(
     gemm_02: bool = False,
     gemm_03: bool = False,
     gemm_04: bool = False,
+    gemm_05: bool = False,
 ):
     if smoke_test:
         smoke.remote()
@@ -151,5 +167,7 @@ def main(
         gemm_03_k_loop.remote(m=m, n=n, k=k, iters=iters)
     elif gemm_04:
         gemm_04_pipelined.remote(m=m, n=n, k=k, iters=iters)
+    elif gemm_05:
+        gemm_05_warp_specialized.remote(m=m, n=n, k=k, iters=iters)
     else:
         fp16_gemm.remote(m=m, n=n, k=k, iters=iters)

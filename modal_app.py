@@ -144,6 +144,21 @@ def gemm_05_warp_specialized(m: int = 256, n: int = 512, k: int = 4096, iters: i
     cutedsl_cache.commit()
 
 
+@app.function(gpu=GPU, volumes=VOLUMES, env=ENV, timeout=900)
+def gemm_06_swizzling(m: int = 256, n: int = 512, k: int = 4096, iters: int = 50):
+    """A 128B-swizzled SMEM layout with a 64-deep K tile."""
+    import cutlass
+    import torch
+    from kernels.gemm_06_swizzling import run
+
+    cutlass.cuda.initialize_cuda_context()
+    props = torch.cuda.get_device_properties(0)
+    print(f"{props.name}  sm_{props.major}{props.minor}")
+
+    run(m=m, n=n, k=k, iters=iters)
+    cutedsl_cache.commit()
+
+
 @app.local_entrypoint()
 def main(
     m: int = 8192,
@@ -156,6 +171,7 @@ def main(
     gemm_03: bool = False,
     gemm_04: bool = False,
     gemm_05: bool = False,
+    gemm_06: bool = False,
 ):
     if smoke_test:
         smoke.remote()
@@ -169,5 +185,7 @@ def main(
         gemm_04_pipelined.remote(m=m, n=n, k=k, iters=iters)
     elif gemm_05:
         gemm_05_warp_specialized.remote(m=m, n=n, k=k, iters=iters)
+    elif gemm_06:
+        gemm_06_swizzling.remote(m=m, n=n, k=k, iters=iters)
     else:
         fp16_gemm.remote(m=m, n=n, k=k, iters=iters)

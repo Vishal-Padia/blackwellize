@@ -174,6 +174,20 @@ def gemm_07_epilogue_pipelining(m: int = 256, n: int = 512, k: int = 4096, iters
     cutedsl_cache.commit()
 
 
+@app.function(gpu=GPU, volumes=VOLUMES, env=ENV, timeout=900)
+def gemm_08_tma_multicast(m: int = 256, n: int = 512, k: int = 4096, iters: int = 50):
+    """A TMA multicast kernel."""
+    import cutlass
+    import torch
+    from kernels.gemm_08_tma_multicast import run
+
+    cutlass.cuda.initialize_cuda_context()
+    props = torch.cuda.get_device_properties(0)
+    print(f"{props.name}  sm_{props.major}{props.minor}")
+
+    run(m=m, n=n, k=k, iters=iters)
+    cutedsl_cache.commit()
+
 @app.local_entrypoint()
 def main(
     m: int = 8192,
@@ -188,6 +202,7 @@ def main(
     gemm_05: bool = False,
     gemm_06: bool = False,
     gemm_07: bool = False,
+    gemm_08: bool = False,
 ):
     if smoke_test:
         smoke.remote()
@@ -205,5 +220,7 @@ def main(
         gemm_06_swizzling.remote(m=m, n=n, k=k, iters=iters)
     elif gemm_07:
         gemm_07_epilogue_pipelining.remote(m=m, n=n, k=k, iters=iters)
+    elif gemm_08:
+        gemm_08_tma_multicast.remote(m=m, n=n, k=k, iters=iters)
     else:
         fp16_gemm.remote(m=m, n=n, k=k, iters=iters)

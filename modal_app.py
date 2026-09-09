@@ -84,11 +84,36 @@ def gemm_01_one_cta(m: int = 128, n: int = 256, k: int = 64):
     cutedsl_cache.commit()
 
 
+@app.function(gpu=GPU, volumes=VOLUMES, env=ENV, timeout=900)
+def gemm_02_multi_cta(m: int = 256, n: int = 512, k: int = 16):
+    """One UMMA per CTA across a grid of tiles."""
+    import cutlass
+    import torch
+    from kernels.gemm_02_multi_cta import run
+
+    cutlass.cuda.initialize_cuda_context()
+    props = torch.cuda.get_device_properties(0)
+    print(f"{props.name}  sm_{props.major}{props.minor}")
+
+    run(m=m, n=n, k=k)
+    cutedsl_cache.commit()
+
+
 @app.local_entrypoint()
-def main(m: int = 8192, n: int = 8192, k: int = 8192, iters: int = 20, smoke_test: bool = False, gemm_01: bool = False):
+def main(
+    m: int = 8192,
+    n: int = 8192,
+    k: int = 8192,
+    iters: int = 20,
+    smoke_test: bool = False,
+    gemm_01: bool = False,
+    gemm_02: bool = False,
+):
     if smoke_test:
         smoke.remote()
     elif gemm_01:
         gemm_01_one_cta.remote(m=m, n=n, k=k)
+    elif gemm_02:
+        gemm_02_multi_cta.remote(m=m, n=n, k=k)
     else:
         fp16_gemm.remote(m=m, n=n, k=k, iters=iters)

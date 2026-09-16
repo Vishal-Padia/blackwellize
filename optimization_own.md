@@ -27,11 +27,13 @@ Output per kernel: time in microseconds, TFLOP/s, and the ratio against torch.
 
 # The Starting Point
 
-The kernel before the first rung (see [PR #3](https://github.com/blackwellize/blackwellize/pull/3)) is the starting point, and we started making optimizations on top of it. It's very minimal, and here each CTA loads a single MMA tile of A and B from global memory to shared memory via `cute.copy()` behind an mbarrier, issues one UMMA through `cute.gemm()`, and writes to accumulator. 
+The kernel before the first rung (see [PR #3](https://github.com/Vishal-Padia/blackwellize/pull/3)) is the starting point, and we started making optimizations on top of it. It's very minimal, and here each CTA loads a single MMA tile of A and B from global memory to shared memory via `cute.copy()` behind an mbarrier, issues one UMMA through `cute.gemm()`, and writes to accumulator. 
 
 # Optimization Rungs
 
 ## 1. K-loop, 1 stage (baseline)
+
+[PR #4](https://github.com/Vishal-Padia/blackwellize/pull/4)
 
 Each block previously performed one MMA, which would only work if K fits in the single `k=16` tile. This rung splits k into chunks of 16, and performs one MMA per chunk and accumulates the results.
 
@@ -52,6 +54,8 @@ Results (4096^3, 50 iters):
 
 ## 2. 4-stage pipeline
 
+[PR #5](https://github.com/Vishal-Padia/blackwellize/pull/5)
+
 **`num_stages` is the number of SMEM buffers, not a split of K**. The two are independent.
 
 The loops still runs like 256 times, the change is how we load from global memory.
@@ -69,6 +73,8 @@ Results (4096^3, 50 iters):
 
 ## 3. Warp Specialization
 
+[PR #7](https://github.com/Vishal-Padia/blackwellize/pull/7)
+
 Previously only one warp did the job that in a sequence (ie not parallel), and the rest of the warps were idle until the epilogue. And in this rung, we split the roles between the warps.
 
 ```
@@ -85,6 +91,8 @@ Results (4096^3, 50 iters):
 | torch   | 94.4 us  | 1456.4  |       |
 
 ## 4. 128B Swizzle
+
+[PR #8](https://github.com/Vishal-Padia/blackwellize/pull/8)
 
 Shared memory is 32 banks of 4 bytes, wrapping every 128 bytes. With `tile_k = 64`, one row of A is 64 fp16 = exactly 128 bytes, and the row stride is also 128 bytes, so **every row starts at bank 0**. TMA writes many rows concurrently and they all pile onto the same banks in the same order.
 
@@ -106,6 +114,8 @@ Results:
 
 ## 5. Pipelined Epilogue
 
+[PR #9](https://github.com/Vishal-Padia/blackwellize/pull/9)
+
 The epilogue moves the accumulator out in four chunks, each TMEM -> RMEM -> convert -> GMEM. Rungs 1-4 reuse a single `acc_frag`/`out_frag` pair for all four, which looks like a write-after-read hazard: chunk `i+1`'s TMEM read wants the registers chunk `i`'s conversion is still using. This rung double-buffers them and issues chunk `i+1`'s read before converting chunk `i`.
 
 For scale: the whole epilogue is at most ~13 us of the 109, so even a perfect version could not have been worth more than ~12%.
@@ -119,6 +129,8 @@ Results (4096^3, 50 iters):
 
 ## 6. TMA Multicast
 
+[PR #10](https://github.com/Vishal-Padia/blackwellize/pull/10)
+
 At 4096^3 the grid is 32 x 16 = 512 CTAs. Each CTA loads the A tile selected by `bidx` and the B tile selected by `bidy`, so the 16 CTAs sharing a `bidx` each independently request the same A tile. 
 
 Multicast makes one TMA request deliver into several CTAs' SMEM at once, which requires them to be in a cluster. With `cluster = (2, 2)`, `tma_partition` splits each tile across the multicast group so every CTA *issues* half a tile and *receives* a whole one. Both A and B get 2x, halving the bytes requested from L2.
@@ -131,6 +143,8 @@ Results (4096^3, 50 iters):
 | torch   | 93.5 us  | 1469.6  |       |
 
 ## 7. 2-CTA tcgen05
+
+[PR #11](https://github.com/Vishal-Padia/blackwellize/pull/11)
 
 With `CtaGroup.TWO`, a **pair** of CTAs issues one 256-wide MMA together. Each supplies half the operands from its own SMEM and holds half the accumulator in its own TMEM. `cluster = (2, 1)`, just the pair, no multicast.
 

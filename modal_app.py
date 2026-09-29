@@ -202,6 +202,20 @@ def gemm_09_2cta_tcgen05(m: int = 256, n: int = 512, k: int = 4096, iters: int =
     run(m=m, n=n, k=k, iters=iters)
     cutedsl_cache.commit()
 
+@app.function(gpu=GPU, volumes=VOLUMES, env=ENV, timeout=900)
+def gemm_10_persistent_kernel(m: int = 256, n: int = 512, k: int = 4096, iters: int = 50):
+    """A persistent gemm kernel."""
+    import cutlass
+    import torch
+    from kernels.gemm_10_persistent_kernel import run
+
+    cutlass.cuda.initialize_cuda_context()
+    props = torch.cuda.get_device_properties(0)
+    print(f"{props.name}  sm_{props.major}{props.minor}")
+
+    run(m=m, n=n, k=k, iters=iters)
+    cutedsl_cache.commit()
+
 @app.local_entrypoint()
 def main(
     m: int = 8192,
@@ -218,6 +232,7 @@ def main(
     gemm_07: bool = False,
     gemm_08: bool = False,
     gemm_09: bool = False,
+    gemm_10: bool = False,
 ):
     if smoke_test:
         smoke.remote()
@@ -239,5 +254,7 @@ def main(
         gemm_08_tma_multicast.remote(m=m, n=n, k=k, iters=iters)
     elif gemm_09:
         gemm_09_2cta_tcgen05.remote(m=m, n=n, k=k, iters=iters)
+    elif gemm_10:
+        gemm_10_persistent_kernel.remote(m=m, n=n, k=k, iters=iters)
     else:
         fp16_gemm.remote(m=m, n=n, k=k, iters=iters)

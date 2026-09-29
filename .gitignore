@@ -222,3 +222,6 @@ __marimo__/
 
 # .ncu.rep files
 profiling_outputs/
+
+# results dir
+results/

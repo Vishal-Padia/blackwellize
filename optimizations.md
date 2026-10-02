@@ -161,7 +161,7 @@ I should have checked the size of the prize first. The whole epilogue is at most
 
 At 4096 cubed the grid is 32 by 16 CTAs, so the 16 CTAs that share a row each independently fetch the same A tile. Multicast lets one TMA request deliver into the shared memory of several CTAs in a cluster, so with a 2 by 2 cluster the bytes requested from L2 halve for both A and B. [Thien Tran](https://x.com/gaunernst) had told me this would not help, and said to draw my own conclusions.
 
-![Thien Tran: "From my experience TMA multicast is not very useful but you should definitely try and draw your own observations!"](https://raw.githubusercontent.com/Vishal-Padia/blackwellize/master/images/no_speed_up_tma.png)
+<img src="https://raw.githubusercontent.com/Vishal-Padia/blackwellize/master/images/no_speed_up_tma.png" alt="Thien Tran: From my experience TMA multicast is not very useful but you should definitely try and draw your own observations!" width="500">
 
 He was right. At 4096 cubed it is 109.4 us against 110.2, decode is flat on every shape, and the 8192 cubed prefill shape got about 6% worse (918 us against 864), which I have no measured explanation for. The profile shows the mechanism works, since L1/TEX throughput drops from 68.3% to 59.2%. It was a null result because the kernel was already limited by compute, with DRAM at 9 to 10% since the swizzle.
 
